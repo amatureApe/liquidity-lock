@@ -3,15 +3,17 @@ pragma solidity ^0.8.24;
 
 import "@openzeppelin/contracts/token/ERC1155/ERC1155.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
+import {PoolManager} from "v4-core/PoolManager.sol";
 import {BaseHook} from "v4-periphery/BaseHook.sol";
 import {Currency} from "v4-core/types/Currency.sol";
 import {Hooks} from "v4-core/libraries/Hooks.sol";
+import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
 import {PoolKey} from "v4-core/types/PoolKey.sol";
-import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
+import {TickMath} from "v4-core/libraries/TickMath.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
 
 import {PoolId} from "v4-core/types/PoolId.sol";
-import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
 import {LiquidityAmounts} from "v4-periphery/libraries/LiquidityAmounts.sol";
 
 // Liquidity Lock is a hook that allows users to lock their liquidity for a certain period of time and earn rewards.
@@ -42,7 +44,7 @@ contract LiquidityLock is BaseHook {
     }
 
     struct RewardsPerLiquidity {
-        uint256 idx; // Index in the array
+        uint256 idx;
         address funder;
         uint256 amount;
         uint128 liquidity;
@@ -51,13 +53,25 @@ contract LiquidityLock is BaseHook {
     struct Lock {
         uint256 lockId;
         uint256 lockDate;
-        uint256 lockDuration;
+        LockDuration lockDuration;
         uint128 liquidity;
         address user;
         address rewardToken;
+        uint256 rewardAmount;
         PoolId poolId;
         int24 lowerTick;
         int24 upperTick;
+    }
+
+    struct LockLiquidityParams {
+        PoolKey key;
+        uint256 amountToken0;
+        uint256 amountToken1;
+        address rewardToken;
+        uint256 idx;
+        int24 lowerTick;
+        int24 upperTick;
+        LockDuration lockDuration;
     }
 
     event CreateRewards(
@@ -164,69 +178,39 @@ contract LiquidityLock is BaseHook {
     }
 
     function lockLiquidity(
-        PoolKey calldata key,
-        int24 lowerTick,
-        int24 upperTick,
-        LockDuration lockDuration,
-        uint256 amountToken0,
-        uint256 amountToken1,
-        address rewardToken,
-        uint256 idx
+        LockLiquidityParams calldata params
     ) external returns (bytes4) {
-        PoolId poolId = PoolIdLibrary.toId(key);
-
-        (uint160 sqrtPriceX96, , , ) = poolManager.getSlot0(poolId);
+        PoolId poolId = PoolIdLibrary.toId(params.key);
+        (uint160 sqrtPriceX96, , , ) = StateLibrary.getSlot0(
+            poolManager,
+            poolId
+        );
 
         uint128 liquidityToLock = LiquidityAmounts.getLiquidityForAmounts(
             sqrtPriceX96,
-            TickMath.getSqrtRatioAtTick(lowerTick),
-            TickMath.getSqrtRatioAtTick(upperTick),
-            amountToken0,
-            amountToken1
+            TickMath.getSqrtPriceAtTick(params.lowerTick),
+            TickMath.getSqrtPriceAtTick(params.upperTick),
+            params.amountToken0,
+            params.amountToken1
         );
-
         require(liquidityToLock > 0, "Cannot lock 0 liquidity");
 
         RewardsPerLiquidity storage reward = availableRewards[poolId][
-            lowerTick
-        ][upperTick][lockDuration][rewardToken][idx];
-
-        int128 availableRewardLiquidity = reward.liquidity;
-
+            params.lowerTick
+        ][params.upperTick][params.lockDuration][params.rewardToken][
+            params.idx
+        ];
         require(
-            availableRewardLiquidity >= liquidityToLock,
+            reward.liquidity >= liquidityToLock,
             "Not enough rewards available"
         );
 
-        // Calculate the ratio of locked liquidity to available reward liquidity
-        uint256 liquidityRewardsRatio = (uint256(liquidityToLock) * 1e18) /
-            uint256(availableRewardLiquidity);
+        uint256 rewardAmount = calculateRewardAmount(reward, liquidityToLock);
 
-        // Calculate the amount of rewardToken to distribute based on the ratio
-        uint256 rewardAmount = (reward.amount * liquidityRewardsRatio) / 1e18;
-
-        // Decrease the available amount of rewardToken
-        reward.amount -= rewardAmount;
-        reward.liquidity -= liquidityToLock;
-
-        uint256 lockId = userLocks[msg.sender].length;
-
-        userLocks[msg.sender].push(
-            Lock({
-                lockId: lockId,
-                lockDate: block.timestamp,
-                lockDuration: durationToSeconds(lockDuration),
-                liquidity: liquidityToLock,
-                user: msg.sender,
-                rewardToken: rewardToken,
-                poolId: poolId,
-                lowerTick: lowerTick,
-                upperTick: upperTick
-            })
-        );
+        updateUserLocks(params, liquidityToLock, rewardAmount, poolId);
 
         // Transfer the calculated reward amount to the user
-        IERC20(rewardToken).transfer(msg.sender, rewardAmount);
+        IERC20(params.rewardToken).transfer(msg.sender, rewardAmount);
 
         return 0x150b7a02; // bytes4(keccak256("onERC1155Received(address,address,uint256,uint256,bytes)"))
     }
@@ -234,6 +218,40 @@ contract LiquidityLock is BaseHook {
     ////////////////////////////////////////////////
     //              HELPER FUNTIONS              //
     ////////////////////////////////////////////////
+    function calculateRewardAmount(
+        RewardsPerLiquidity storage reward,
+        uint128 liquidityToLock
+    ) private returns (uint256 rewardAmount) {
+        uint256 liquidityRewardsRatio = (uint256(liquidityToLock) * 1e18) /
+            uint256(reward.liquidity);
+        rewardAmount = (reward.amount * liquidityRewardsRatio) / 1e18;
+        reward.amount -= rewardAmount;
+        reward.liquidity -= liquidityToLock;
+        return rewardAmount;
+    }
+
+    function updateUserLocks(
+        LockLiquidityParams calldata params,
+        uint128 liquidityToLock,
+        uint256 rewardAmount,
+        PoolId poolId
+    ) private {
+        uint256 lockId = userLocks[msg.sender].length;
+        userLocks[msg.sender].push(
+            Lock({
+                lockId: lockId,
+                lockDate: block.timestamp,
+                lockDuration: params.lockDuration,
+                liquidity: liquidityToLock,
+                user: msg.sender,
+                rewardToken: params.rewardToken,
+                poolId: poolId,
+                lowerTick: params.lowerTick,
+                upperTick: params.upperTick,
+                rewardAmount: rewardAmount
+            })
+        );
+    }
     function durationToSeconds(
         LockDuration duration
     ) public pure returns (uint256) {
