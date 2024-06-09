@@ -97,6 +97,7 @@ contract LiquidityLock is BaseHook {
     error TooMuchSlippage();
     error CannotUnlockYet(uint256 unlockDate);
     error AlreadyUnlocked();
+    error InvalidDuration();
 
     ////////////////////////////////////////////////
     //                    SETUP                   //
@@ -129,6 +130,27 @@ contract LiquidityLock is BaseHook {
             });
     }
 
+    function beforeAddLiquidity(
+        address sender,
+        PoolKey calldata,
+        IPoolManager.ModifyLiquidityParams calldata,
+        bytes calldata
+    ) external view override returns (bytes4) {
+        if (sender != address(this)) revert SenderMustBeHook();
+
+        return IHooks.beforeAddLiquidity.selector;
+    }
+
+    function beforeRemoveLiquidity(
+        address sender,
+        PoolKey calldata,
+        IPoolManager.ModifyLiquidityParams calldata,
+        bytes calldata
+    ) external view override returns (bytes4) {
+        if (sender != address(this)) revert SenderMustBeHook();
+
+        return IHooks.beforeRemoveLiquidity.selector;
+    }
     ////////////////////////////////////////////////
     //             MUTATIVE FUNCTIONS             //
     ////////////////////////////////////////////////
@@ -199,17 +221,6 @@ contract LiquidityLock is BaseHook {
         ][idx];
 
         IERC20(rewardToken).transfer(msg.sender, rewardAmount);
-    }
-
-    function beforeAddLiquidity(
-        address sender,
-        PoolKey calldata,
-        IPoolManager.ModifyLiquidityParams calldata,
-        bytes calldata
-    ) external view override returns (bytes4) {
-        if (sender != address(this)) revert SenderMustBeHook();
-
-        return IHooks.beforeAddLiquidity.selector;
     }
 
     function lockLiquidity(
@@ -349,6 +360,6 @@ contract LiquidityLock is BaseHook {
         if (duration == LockDuration.TEN_YEARS) return 3650 days;
         if (duration == LockDuration.TWENTY_YEARS) return 7300 days;
         if (duration == LockDuration.ONE_HUNDRED_YEARS) return 36500 days; // Approximation for 100 years
-        revert("Invalid duration");
+        revert InvalidDuration();
     }
 }
