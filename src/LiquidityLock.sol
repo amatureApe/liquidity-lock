@@ -29,7 +29,8 @@ contract LiquidityLock is BaseHook, IUnlockCallback {
   bytes internal constant ZERO_BYTES = bytes("");
 
   /// @notice Rewards available per pool, indexed by PoolId and position ticks.
-  mapping(PoolId => mapping(int24 => mapping(int24 => mapping(LockDuration => Rewards[])))) public availableRewards;
+  mapping(PoolId => mapping(int24 lowerTick => mapping(int24 upperTick => mapping(LockDuration => Rewards[]))))
+    public availableRewards;
 
   /// @notice Locks per user, allowing tracking of individual liquidity locks.
   mapping(address => Lock[]) public userLocks;
