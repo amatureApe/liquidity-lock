@@ -12,8 +12,9 @@ import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
 import {PoolKey} from "v4-core/types/PoolKey.sol";
 import {TickMath} from "v4-core/libraries/TickMath.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
+import {IHooks} from "v4-core/interfaces/IHooks.sol";
+import {BalanceDelta} from "v4-core/types/BalanceDelta.sol";
 
-import {PoolId} from "v4-core/types/PoolId.sol";
 import {LiquidityAmounts} from "v4-periphery/libraries/LiquidityAmounts.sol";
 
 // Liquidity Lock is a hook that allows users to lock their liquidity for a certain period of time and earn rewards.
@@ -44,7 +45,7 @@ contract LiquidityLock is BaseHook {
     }
 
     struct RewardsPerLiquidity {
-        uint256 idx;
+        uint256 rewardIdx;
         address funder;
         uint256 amount;
         uint128 liquidity;
@@ -58,21 +59,29 @@ contract LiquidityLock is BaseHook {
         address user;
         address rewardToken;
         uint256 rewardAmount;
-        PoolId poolId;
+        PoolKey key;
         int24 lowerTick;
         int24 upperTick;
+        bool unlockedAndWithdrawn;
     }
 
     struct LockLiquidityParams {
         PoolKey key;
-        uint256 amountToken0;
-        uint256 amountToken1;
+        uint256 amount0Desired;
+        uint256 amount1Desired;
+        uint256 amount0Min;
+        uint256 amount1Min;
+        uint256 deadline;
         address rewardToken;
-        uint256 idx;
+        uint256 rewardIdx;
         int24 lowerTick;
         int24 upperTick;
         LockDuration lockDuration;
     }
+
+    ////////////////////////////////////////////////
+    //              EVENTS & ERRORS               //
+    ////////////////////////////////////////////////
 
     event CreateRewards(
         address indexed rewardsToken,
@@ -81,6 +90,17 @@ contract LiquidityLock is BaseHook {
         address funder,
         LockDuration lockDuration
     );
+
+    error SenderMustBeHook();
+    error PoolNotInitialized();
+    error NoLiquidityToLock();
+    error TooMuchSlippage();
+    error CannotUnlockYet(uint256 unlockDate);
+    error AlreadyUnlocked();
+
+    ////////////////////////////////////////////////
+    //                    SETUP                   //
+    ////////////////////////////////////////////////
 
     constructor(IPoolManager _poolManager) BaseHook(_poolManager) {}
 
@@ -109,6 +129,10 @@ contract LiquidityLock is BaseHook {
             });
     }
 
+    ////////////////////////////////////////////////
+    //             MUTATIVE FUNCTIONS             //
+    ////////////////////////////////////////////////
+
     function createRewards(
         PoolKey calldata key,
         int24 lowerTick,
@@ -120,14 +144,14 @@ contract LiquidityLock is BaseHook {
     ) external {
         PoolId poolId = PoolIdLibrary.toId(key);
 
-        uint256 idx = availableRewards[poolId][lowerTick][upperTick][
+        uint256 rewardIdx = availableRewards[poolId][lowerTick][upperTick][
             lockDuration
         ][rewardToken].length;
         availableRewards[poolId][lowerTick][upperTick][lockDuration][
             rewardToken
         ].push(
                 RewardsPerLiquidity({
-                    idx: idx,
+                    rewardIdx: rewardIdx,
                     funder: msg.sender,
                     amount: rewardsAmount,
                     liquidity: liquidity
@@ -177,81 +201,141 @@ contract LiquidityLock is BaseHook {
         IERC20(rewardToken).transfer(msg.sender, rewardAmount);
     }
 
+    function beforeAddLiquidity(
+        address sender,
+        PoolKey calldata,
+        IPoolManager.ModifyLiquidityParams calldata,
+        bytes calldata
+    ) external view override returns (bytes4) {
+        if (sender != address(this)) revert SenderMustBeHook();
+
+        return IHooks.beforeAddLiquidity.selector;
+    }
+
     function lockLiquidity(
         LockLiquidityParams calldata params
-    ) external returns (bytes4) {
+    ) external returns (uint128 liquidityLocked) {
         PoolId poolId = PoolIdLibrary.toId(params.key);
         (uint160 sqrtPriceX96, , , ) = StateLibrary.getSlot0(
             poolManager,
             poolId
         );
 
+        if (sqrtPriceX96 == 0) revert PoolNotInitialized();
+
         uint128 liquidityToLock = LiquidityAmounts.getLiquidityForAmounts(
             sqrtPriceX96,
             TickMath.getSqrtPriceAtTick(params.lowerTick),
             TickMath.getSqrtPriceAtTick(params.upperTick),
-            params.amountToken0,
-            params.amountToken1
+            params.amount0Desired,
+            params.amount1Desired
         );
-        require(liquidityToLock > 0, "Cannot lock 0 liquidity");
 
-        RewardsPerLiquidity storage reward = availableRewards[poolId][
+        if (liquidityToLock <= 0) revert NoLiquidityToLock();
+
+        RewardsPerLiquidity storage rewards = availableRewards[poolId][
             params.lowerTick
         ][params.upperTick][params.lockDuration][params.rewardToken][
-            params.idx
+            params.rewardIdx
         ];
-        require(
-            reward.liquidity >= liquidityToLock,
-            "Not enough rewards available"
+
+        uint256 rewardAmount = calculateRewardAmount(rewards, liquidityToLock);
+
+        createLock(params, liquidityToLock, rewardAmount);
+
+        (BalanceDelta addedDelta, ) = poolManager.modifyLiquidity(
+            params.key,
+            IPoolManager.ModifyLiquidityParams({
+                tickLower: params.lowerTick,
+                tickUpper: params.upperTick,
+                liquidityDelta: int256(uint256(liquidityToLock)),
+                salt: 0
+            }),
+            ""
         );
 
-        uint256 rewardAmount = calculateRewardAmount(reward, liquidityToLock);
-
-        updateUserLocks(params, liquidityToLock, rewardAmount, poolId);
+        if (
+            uint128(-addedDelta.amount0()) < params.amount0Min ||
+            uint128(-addedDelta.amount1()) < params.amount1Min
+        ) {
+            revert TooMuchSlippage();
+        }
 
         // Transfer the calculated reward amount to the user
         IERC20(params.rewardToken).transfer(msg.sender, rewardAmount);
 
-        return 0x150b7a02; // bytes4(keccak256("onERC1155Received(address,address,uint256,uint256,bytes)"))
+        return liquidityToLock;
+    }
+
+    function unlockLiquidity(uint256 lockId) external {
+        Lock storage lock = userLocks[msg.sender][lockId];
+
+        if (
+            block.timestamp <
+            lock.lockDate + durationToSeconds(lock.lockDuration)
+        )
+            revert CannotUnlockYet(
+                lock.lockDate + durationToSeconds(lock.lockDuration)
+            );
+
+        if (lock.unlockedAndWithdrawn) revert AlreadyUnlocked();
+
+        lock.unlockedAndWithdrawn = true;
+
+        poolManager.modifyLiquidity(
+            lock.key,
+            IPoolManager.ModifyLiquidityParams({
+                tickLower: lock.lowerTick,
+                tickUpper: lock.upperTick,
+                liquidityDelta: -int256(uint256(lock.liquidity)),
+                salt: 0
+            }),
+            ""
+        );
     }
 
     ////////////////////////////////////////////////
     //              HELPER FUNTIONS              //
     ////////////////////////////////////////////////
     function calculateRewardAmount(
-        RewardsPerLiquidity storage reward,
+        RewardsPerLiquidity storage rewards,
         uint128 liquidityToLock
     ) private returns (uint256 rewardAmount) {
-        uint256 liquidityRewardsRatio = (uint256(liquidityToLock) * 1e18) /
-            uint256(reward.liquidity);
-        rewardAmount = (reward.amount * liquidityRewardsRatio) / 1e18;
-        reward.amount -= rewardAmount;
-        reward.liquidity -= liquidityToLock;
+        uint128 effectiveLiquidity = liquidityToLock < rewards.liquidity
+            ? liquidityToLock
+            : rewards.liquidity;
+
+        uint256 liquidityRewardsRatio = (uint256(effectiveLiquidity) * 1e18) /
+            rewards.liquidity;
+        rewardAmount = (rewards.amount * liquidityRewardsRatio) / 1e18;
+        rewards.amount -= rewardAmount;
+        rewards.liquidity -= effectiveLiquidity;
+
         return rewardAmount;
     }
 
-    function updateUserLocks(
+    function createLock(
         LockLiquidityParams calldata params,
-        uint128 liquidityToLock,
-        uint256 rewardAmount,
-        PoolId poolId
+        uint128 liquidity,
+        uint256 rewardAmount
     ) private {
-        uint256 lockId = userLocks[msg.sender].length;
-        userLocks[msg.sender].push(
-            Lock({
-                lockId: lockId,
-                lockDate: block.timestamp,
-                lockDuration: params.lockDuration,
-                liquidity: liquidityToLock,
-                user: msg.sender,
-                rewardToken: params.rewardToken,
-                poolId: poolId,
-                lowerTick: params.lowerTick,
-                upperTick: params.upperTick,
-                rewardAmount: rewardAmount
-            })
-        );
+        Lock memory newLock = Lock({
+            lockId: userLocks[msg.sender].length,
+            lockDate: block.timestamp,
+            lockDuration: params.lockDuration,
+            liquidity: liquidity,
+            user: msg.sender,
+            rewardToken: params.rewardToken,
+            rewardAmount: rewardAmount,
+            key: params.key,
+            lowerTick: params.lowerTick,
+            upperTick: params.upperTick,
+            unlockedAndWithdrawn: false
+        });
+
+        userLocks[msg.sender].push(newLock);
     }
+
     function durationToSeconds(
         LockDuration duration
     ) public pure returns (uint256) {
