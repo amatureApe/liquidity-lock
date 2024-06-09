@@ -20,6 +20,9 @@ import { LiquidityAmounts } from "v4-periphery/libraries/LiquidityAmounts.sol";
 
 /// @title Liquidity Lock Contract for Pool Liquidity Management
 /// @notice This contract provides functionalities to lock liquidity into pools, manage rewards, and handle lock/unlock events.
+// Liquidity Lock is a hook that allows users to lock their liquidity for a certain period of time and earn rewards.
+// The rewards can be deposited by any user permissionlessly according to their specifications.
+// For this prototype, LPs who decide to lock their rewards are immediately paid out the rewards upon locking.
 contract LiquidityLock is BaseHook, IUnlockCallback {
   using CurrencyLibrary for Currency;
   using CurrencySettler for Currency;
@@ -34,6 +37,10 @@ contract LiquidityLock is BaseHook, IUnlockCallback {
 
   /// @notice Locks per user, allowing tracking of individual liquidity locks.
   mapping(address => Lock[]) public userLocks;
+
+  ////////////////////////////////////////////////
+  //              ENUMS & STRUCTS               //
+  ////////////////////////////////////////////////
 
   /// @notice Duration options for liquidity locks, ranging from one month to one hundred years.
   enum LockDuration {
@@ -153,6 +160,10 @@ contract LiquidityLock is BaseHook, IUnlockCallback {
     uint256[] rewardsAmounts;
   }
 
+  ////////////////////////////////////////////////
+  //              EVENTS & ERRORS               //
+  ////////////////////////////////////////////////
+
   /// @notice Emitted when rewards are added to a pool.
   /// @param rewards Data packet containing the rewards information.
   /// @param liquidity Amount of liquidity associated with the rewards.
@@ -221,6 +232,10 @@ contract LiquidityLock is BaseHook, IUnlockCallback {
 
   /// @notice Error thrown when the number of tokens and amounts does not match in a rewards operation.
   error TokensAndAmountsMismatch();
+
+  ////////////////////////////////////////////////
+  //                 SETUP                      //
+  ////////////////////////////////////////////////
 
   /// @dev Initializes a new LiquidityLock contract linked to a specific PoolManager.
   /// @param _poolManager Address of the PoolManager contract this LiquidityLock will interact with.
@@ -324,6 +339,10 @@ contract LiquidityLock is BaseHook, IUnlockCallback {
     poolManager.take(key.currency0, sender, uint256(uint128(delta.amount0())));
     poolManager.take(key.currency1, sender, uint256(uint128(delta.amount1())));
   }
+
+  ////////////////////////////////////////////////
+  //               MUTATIVE FUNCTION            //
+  ////////////////////////////////////////////////
 
   /// @notice Adds rewards to a specific liquidity pool's tick range.
   /// @dev Ensures that the token and amount arrays are of equal length to avoid mismatch errors.
@@ -454,6 +473,10 @@ contract LiquidityLock is BaseHook, IUnlockCallback {
 
     emit UnlockLiquidity(lockId, msg.sender, lock.liquidity);
   }
+
+  ////////////////////////////////////////////////
+  //               HELPER FUNCTIONS             //
+  ////////////////////////////////////////////////
 
   /// @notice Calculates the reward amounts based on the locked liquidity.
   /// @param rewards Details of the rewards for the liquidity lock.
